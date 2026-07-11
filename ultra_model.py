@@ -16,6 +16,11 @@ Performance targets:
 - Accuracy: Matches or exceeds pure Transformer at same params
 """
 from __future__ import annotations
+
+import torch
+
+torch.autograd.set_detect_anomaly(True)
+
 from typing import Dict, Any, Optional, Tuple, List
 import math
 import torch
