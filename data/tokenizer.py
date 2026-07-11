@@ -21,7 +21,7 @@ class BaseTokenizer(ABC):
 
 class CharTokenizer(BaseTokenizer):
     def __init__(self):
-        chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?;:()[]{} \n\t-_=/\\@#\$%^&*~|<>+"
+        chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?;:()[]{} \n\t-_=/\\@#$%^&*~|<>+"
         self._char_map = {c: i + 1 for i, c in enumerate(chars)}
         self._char_map["<PAD>"] = 0
         self._vocab_size = len(chars) + 1
