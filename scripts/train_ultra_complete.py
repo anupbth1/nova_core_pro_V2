@@ -704,7 +704,12 @@ def train_model(
     )
     
     # ===== LR SCHEDULER =====
-    total_steps = len(train_loader) * config.epochs
+    # Get safe length - streaming datasets don't support __len__
+    try:
+        steps_per_epoch = len(train_loader)
+    except (TypeError, NotImplementedError):
+        steps_per_epoch = 1000
+    total_steps = steps_per_epoch * config.epochs
     
     if config.lr_scheduler == "cosine":
         warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, 
@@ -872,10 +877,14 @@ def train_model(
                 
                 if config.wandb:
                     import wandb
+                    try:
+                        steps_p_epoch = len(train_loader)
+                    except (TypeError, NotImplementedError):
+                        steps_p_epoch = max(global_step - epoch * steps_per_epoch, 1)
                     wandb.log({
                         "train/loss": loss.item(),
                         "train/lr": current_lr,
-                        "train/epoch": epoch + (batch_idx + 1) / len(train_loader),
+                        "train/epoch": epoch + (batch_idx + 1) / max(steps_p_epoch, 1),
                         "train/tokens_per_sec": tok_per_sec,
                         "train/step": global_step,
                     })
@@ -886,8 +895,12 @@ def train_model(
                 save_checkpoint(raw_model, optimizer, scheduler, scaler, 
                                epoch, global_step, best_loss, ckpt_path, config)
         
-        # End of epoch
-        avg_loss = epoch_loss / len(train_loader)
+        # End of epoch - use safe len for streaming
+        try:
+            steps_per_epoch = len(train_loader)
+        except (TypeError, NotImplementedError):
+            steps_per_epoch = max(global_step, 1)
+        avg_loss = epoch_loss / max(steps_per_epoch, 1)
         epoch_time = time.time() - epoch_start
         
         print(f"\n📊 Epoch {epoch+1} completed:")
@@ -923,7 +936,11 @@ def train_model(
                        epoch, global_step, best_loss, latest_path, config)
         
         # Evaluation
-        if val_loader and (global_step % config.eval_every < len(train_loader) or config.epochs == 1):
+        try:
+            _train_len = len(train_loader)
+        except (TypeError, NotImplementedError):
+            _train_len = max(global_step - epoch * steps_per_epoch, 1) if steps_per_epoch > 0 else 1
+        if val_loader and (global_step % config.eval_every < _train_len or config.epochs == 1):
             raw_model.eval()
             val_loss = 0.0
             val_steps = 0
