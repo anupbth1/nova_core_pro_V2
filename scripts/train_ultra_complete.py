@@ -821,9 +821,7 @@ def train_model(
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             
-            # Forward + backward with gradient accumulation
-            loss_scaled = config.grad_clip / accum if config.grad_clip > 0 else 1.0 / accum
-            
+            # Forward pass (no loss division — gradients accumulate naturally)
             if scaler:
                 with torch.cuda.amp.autocast():
                     logits, _ = model(input_ids)
@@ -832,7 +830,7 @@ def train_model(
                         labels.view(-1),
                         label_smoothing=config.label_smoothing,
                     )
-                scaler.scale(loss / accum).backward()
+                scaler.scale(loss).backward()
             elif amp_dtype:
                 with torch.autocast(device_type=amp_device, dtype=amp_dtype):
                     logits, _ = model(input_ids)
@@ -841,7 +839,7 @@ def train_model(
                         labels.view(-1),
                         label_smoothing=config.label_smoothing,
                     )
-                (loss / accum).backward()
+                loss.backward()
             else:
                 logits, _ = model(input_ids)
                 loss = F.cross_entropy(
@@ -849,11 +847,11 @@ def train_model(
                     labels.view(-1),
                     label_smoothing=config.label_smoothing,
                 )
-                (loss / accum).backward()
+                loss.backward()
             
             micro_step += 1
             
-            # Update weights after accumulation steps
+            # Update weights after every accum steps
             if micro_step % accum == 0:
                 if scaler:
                     scaler.unscale_(optimizer)
@@ -867,7 +865,7 @@ def train_model(
                     optimizer.step()
                 optimizer.zero_grad()
                 
-                # Step scheduler
+                # Step scheduler only on optimizer step
                 if config.lr_scheduler != "constant":
                     scheduler.step()
             
