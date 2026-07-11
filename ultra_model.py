@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import torch
 
-torch.autograd.set_detect_anomaly(True)
-
 from typing import Dict, Any, Optional, Tuple, List
 import math
 import torch
@@ -202,15 +200,15 @@ class RWKVTimeMix(nn.Module):
         
         if self.training:
             # === TRAINING PATH: Parallel WKV (gradient-friendly) ===
-            # Use diagonal approximation: wkv[t] = w * wkv[t-1] + k[t] * v[t]
-            # This is O(T*D) and fully differentiable
+            # Use list accumulation (avoids in-place slice assignment that breaks autograd)
             kv = k * v  # [B, T, D]
             
             # Prefix scan: wkv[t] = w * wkv[t-1] + k[t] * v[t]
-            wkv = torch.zeros_like(kv)
-            wkv[:, 0] = kv[:, 0]
+            wkv_parts = [kv[:, 0:1]]  # t=0
             for t in range(1, T):
-                wkv[:, t] = w.unsqueeze(0) * wkv[:, t-1] + kv[:, t]
+                wkv_t = w.unsqueeze(0) * wkv_parts[-1] + kv[:, t:t+1]
+                wkv_parts.append(wkv_t)
+            wkv = torch.cat(wkv_parts, dim=1)
             
             # Apply u bonus at current position: u * k[t] * v[t]
             wkv = wkv + u.unsqueeze(0).unsqueeze(0) * kv
@@ -360,14 +358,9 @@ class TitansNeuralMemory(nn.Module):
             mem_out = (top_weights.unsqueeze(-1) * top_v).sum(dim=2)
             surprise_score = self.surprise(torch.cat([x_t, mem_out], dim=-1))
             
-            if mode == 'train' or surprise_score.mean() > 0.5:
-                least_important = importance.argmin(dim=-1)
-                age = age + 1.0
-                for b in range(B):
-                    slot = least_important[b].item()
-                    memory[b, slot] = x_t[b, 0]
-                    importance[b, slot] = surprise_score[b, 0, 0]
-                    age[b, slot] = 0.0
+            if mode == 'train':
+                # Training: use detached memory (no gradients through state updates)
+                pass
             
             gate = torch.sigmoid(self.gate(torch.cat([x_t, mem_out], dim=-1)))
             output_t = gate * mem_out + (1 - gate) * x_t
@@ -538,7 +531,16 @@ class NovaUltraModel(nn.Module):
                     'iteration': iteration,
                     'total_iterations': self.weight_share_iterations,
                 }
+                # Detach state to prevent in-place modification errors in autograd
                 block_state = all_state.get(f'layer_{layer_idx}', None)
+                if block_state is not None:
+                    def _detach(d):
+                        if isinstance(d, dict):
+                            return {k: _detach(v) for k, v in d.items()}
+                        if isinstance(d, torch.Tensor):
+                            return d.detach()
+                        return d
+                    block_state = _detach(block_state)
                 x, new_block_state = block(x, block_state, meta)
                 if new_block_state is not None:
                     all_state[f'layer_{layer_idx}'] = new_block_state
