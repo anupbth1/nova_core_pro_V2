@@ -55,7 +55,7 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split, IterableDataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, CosineAnnealingWarmRestarts
 from tqdm import tqdm
@@ -66,6 +66,14 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 _project_dir = os.path.dirname(_script_dir)
 if _project_dir not in sys.path:
     sys.path.insert(0, _project_dir)
+
+# Import data pipeline
+try:
+    from data import Pipeline, PipelineConfig, BackendConfig, TokenizerConfig, ChunkConfig, LoaderConfig, FilterConfig
+    HAS_PIPELINE = True
+except ImportError as e:
+    HAS_PIPELINE = False
+    print(f"⚠️  Data pipeline not found ({e}). Using fallback HFDatasetWrapper.")
 
 # Try importing NovaLM-ULTRA (handle hyphen in folder name)
 try:
@@ -1436,10 +1444,20 @@ def main():
         print(f"\n  ✅ Loaded: {config.dataset}")
         if hasattr(hf_dataset, '__len__'):
             print(f"  📊 Samples: {len(hf_dataset):,}")
+        else:
+            print(f"  📊 Samples: streaming (unknown count)")
         
-        # Sample
-        sample_text = hf_dataset[0].get(config.text_column, "")
-        print(f"  📝 Sample: {str(sample_text)[:150]}...")
+        # Sample (streaming-safe)
+        try:
+            if config.streaming:
+                sample_iter = iter(hf_dataset)
+                first_sample = next(sample_iter)
+                sample_text = first_sample.get(config.text_column, "")
+            else:
+                sample_text = hf_dataset[0].get(config.text_column, "")
+            print(f"  📝 Sample: {str(sample_text)[:150]}...")
+        except Exception as sample_err:
+            print(f"  📝 Sample: (could not preview: {sample_err})")
         
     except Exception as e:
         print(f"❌ Dataset error: {e}")
@@ -1463,69 +1481,147 @@ def main():
     print(f"🔨 PREPARING DATA")
     print(f"{'='*60}")
     
-    train_dataset = HFDatasetWrapper(
-        hf_dataset, tokenizer,
-        block_size=config.block_size,
-        text_column=config.text_column,
-        min_text_len=config.min_text_len,
-        max_text_len=config.max_text_len,
-        max_samples=config.max_samples,
-    )
-    
-    # Validation split
-    val_loader = None
-    if config.val_dataset:
-        try:
-            val_hf = load_dataset(config.val_dataset, split=config.val_split)
-            val_dataset = HFDatasetWrapper(
-                val_hf, tokenizer,
-                block_size=config.block_size,
+    # Use new Pipeline if available, otherwise fall back to HFDatasetWrapper
+    if HAS_PIPELINE:
+        # Build pipeline config from AllConfig
+        pipeline_config = PipelineConfig(
+            streaming=config.streaming,
+            backend=BackendConfig(
+                dataset_name=config.dataset,
+                subset=config.dataset_subset,
+                split=config.dataset_split,
                 text_column=config.text_column,
-            )
-            if len(val_dataset) > 0:
+                shuffle_buffer=10000,
+                max_samples=config.max_samples,
+            ),
+            tokenizer=TokenizerConfig(
+                type=config.tokenizer,
+                tokenizer_name=config.hf_tokenizer,
+                add_pad=config.add_pad_token,
+                cache_size=512,
+            ),
+            chunker=ChunkConfig(
+                block_size=config.block_size,
+                overlap=True,
+            ),
+            loader=LoaderConfig(
+                batch_size=config.batch_size,
+                num_workers=config.num_workers,
+                pin_memory=config.device == "cuda",
+                prefetch_factor=2,
+                seed=42,
+            ),
+            filter=FilterConfig(
+                min_text_len=config.min_text_len,
+                max_text_len=config.max_text_len,
+            ),
+        )
+        
+        pipeline = Pipeline(pipeline_config)
+        train_loader = pipeline.create_dataloader()
+        
+        if config.streaming and hasattr(pipeline.backend, 'iter_documents'):
+            first = next(iter(pipeline.backend.iter_documents()))
+        else:
+            first = pipeline.backend[0]
+        print(f"  📝 Sample: {str(first.get(config.text_column, ''))[:150]}...")
+        
+        # Validation - use separate pipeline if val_dataset specified
+        val_loader = None
+        if config.val_dataset:
+            try:
+                val_config = PipelineConfig(
+                    streaming=False,
+                    backend=BackendConfig(
+                        dataset_name=config.val_dataset,
+                        subset=None,
+                        split=config.val_split,
+                        text_column=config.text_column,
+                    ),
+                    tokenizer=TokenizerConfig(
+                        type=config.tokenizer,
+                        tokenizer_name=config.hf_tokenizer,
+                        add_pad=config.add_pad_token,
+                    ),
+                    chunker=ChunkConfig(
+                        block_size=config.block_size,
+                        overlap=True,
+                    ),
+                    loader=LoaderConfig(
+                        batch_size=config.batch_size,
+                        num_workers=0,
+                    ),
+                )
+                val_pipeline = Pipeline(val_config)
+                val_loader = val_pipeline.create_dataloader()
+                print(f"  📊 Validation dataset: {config.val_dataset}")
+            except Exception as e:
+                print(f"  ⚠️  Could not load validation dataset: {e}")
+    else:
+        # Fallback to old HFDatasetWrapper (for backward compatibility)
+        train_dataset = HFDatasetWrapper(
+            hf_dataset, tokenizer,
+            block_size=config.block_size,
+            text_column=config.text_column,
+            min_text_len=config.min_text_len,
+            max_text_len=config.max_text_len,
+            max_samples=config.max_samples,
+        )
+        
+        # Validation split
+        val_loader = None
+        if config.val_dataset:
+            try:
+                val_hf = load_dataset(config.val_dataset, split=config.val_split)
+                val_dataset = HFDatasetWrapper(
+                    val_hf, tokenizer,
+                    block_size=config.block_size,
+                    text_column=config.text_column,
+                )
+                if len(val_dataset) > 0:
+                    val_loader = DataLoader(
+                        val_dataset, batch_size=config.batch_size,
+                        shuffle=False, num_workers=config.num_workers,
+                    )
+            except:
+                pass
+        
+        if val_loader is None and config.val_size > 0:
+            # Split train into train/val
+            val_len = int(len(train_dataset) * config.val_size)
+            train_len = len(train_dataset) - val_len
+            if val_len > 0 and train_len > 0:
+                train_subset, val_subset = random_split(
+                    train_dataset, [train_len, val_len],
+                    generator=torch.Generator().manual_seed(42),
+                )
+                
+                from torch.utils.data import Subset
+                class SubsetWrapper(Dataset):
+                    def __init__(self, subset):
+                        self.subset = subset
+                    def __len__(self):
+                        return len(self.subset)
+                    def __getitem__(self, idx):
+                        return self.subset[idx]
+                
+                train_dataset = SubsetWrapper(train_subset)
+                val_dataset = SubsetWrapper(val_subset)
+                
                 val_loader = DataLoader(
                     val_dataset, batch_size=config.batch_size,
                     shuffle=False, num_workers=config.num_workers,
                 )
-        except:
-            pass
-    
-    if val_loader is None and config.val_size > 0:
-        # Split train into train/val
-        val_len = int(len(train_dataset) * config.val_size)
-        train_len = len(train_dataset) - val_len
-        if val_len > 0 and train_len > 0:
-            train_subset, val_subset = random_split(
-                train_dataset, [train_len, val_len],
-                generator=torch.Generator().manual_seed(42),
-            )
-            
-            from torch.utils.data import Subset
-            class SubsetWrapper(Dataset):
-                def __init__(self, subset):
-                    self.subset = subset
-                def __len__(self):
-                    return len(self.subset)
-                def __getitem__(self, idx):
-                    return self.subset[idx]
-            
-            train_dataset = SubsetWrapper(train_subset)
-            val_dataset = SubsetWrapper(val_subset)
-            
-            val_loader = DataLoader(
-                val_dataset, batch_size=config.batch_size,
-                shuffle=False, num_workers=config.num_workers,
-            )
-            print(f"  Validation split: {val_len} samples")
-    
-    # Train loader
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=config.device == "cuda",
-    )
+                print(f"  Validation split: {val_len} samples")
+        
+        # Train loader
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=config.device == "cuda",
+        )
     
     # ===== CREATE MODEL =====
     model = create_model(config)
