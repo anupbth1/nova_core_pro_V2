@@ -238,6 +238,9 @@ class AllConfig:
     beta2:          Adam beta2 (default: 0.95). RMS prop.
     grad_clip:      Max gradient norm (default: 1.0).
                    [0.5=strict, 1.0=default, 5.0=loose, None=off]
+    grad_accum:     Gradient accumulation steps (default: 1).
+                   Effective batch = batch_size * grad_accum.
+                   [1=no accum, 2-8=save GPU memory]
     dropout:        Dropout rate (default: 0.0).
                    [0.0=none, 0.1=light, 0.2=standard]
     label_smoothing: Label smoothing for loss (default: 0.0).
@@ -256,6 +259,7 @@ class AllConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    grad_accum: int = 1
     dropout: float = 0.0
     label_smoothing: float = 0.0
     lr_scheduler: str = "cosine"
@@ -809,13 +813,16 @@ def train_model(
         epoch_tokens = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}")
+        accum = config.grad_accum
+        optimizer.zero_grad()
+        micro_step = 0
         for batch_idx, batch in enumerate(pbar):
             # Move to device
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             
-            # Forward pass
-            optimizer.zero_grad()
+            # Forward + backward with gradient accumulation
+            loss_scaled = config.grad_clip / accum if config.grad_clip > 0 else 1.0 / accum
             
             if scaler:
                 with torch.cuda.amp.autocast():
@@ -825,12 +832,7 @@ def train_model(
                         labels.view(-1),
                         label_smoothing=config.label_smoothing,
                     )
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                if config.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(raw_model.parameters(), config.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss / accum).backward()
             elif amp_dtype:
                 with torch.autocast(device_type=amp_device, dtype=amp_dtype):
                     logits, _ = model(input_ids)
@@ -839,10 +841,7 @@ def train_model(
                         labels.view(-1),
                         label_smoothing=config.label_smoothing,
                     )
-                loss.backward()
-                if config.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(raw_model.parameters(), config.grad_clip)
-                optimizer.step()
+                (loss / accum).backward()
             else:
                 logits, _ = model(input_ids)
                 loss = F.cross_entropy(
@@ -850,14 +849,27 @@ def train_model(
                     labels.view(-1),
                     label_smoothing=config.label_smoothing,
                 )
-                loss.backward()
-                if config.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(raw_model.parameters(), config.grad_clip)
-                optimizer.step()
+                (loss / accum).backward()
             
-            # Step scheduler
-            if config.lr_scheduler != "constant":
-                scheduler.step()
+            micro_step += 1
+            
+            # Update weights after accumulation steps
+            if micro_step % accum == 0:
+                if scaler:
+                    scaler.unscale_(optimizer)
+                    if config.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), config.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if config.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), config.grad_clip)
+                    optimizer.step()
+                optimizer.zero_grad()
+                
+                # Step scheduler
+                if config.lr_scheduler != "constant":
+                    scheduler.step()
             
             global_step += 1
             epoch_loss += loss.item()
@@ -1205,6 +1217,8 @@ EXAMPLES:
                             help="Adam beta2 (RMS)")
     train_group.add_argument("--grad-clip", type=float, default=1.0,
                             help="Gradient clipping (0.5=strict, 1.0=default, 0=off)")
+    train_group.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                            help="Gradient accumulation steps (default: 1). Effective batch = batch_size * grad_accum")
     train_group.add_argument("--dropout", type=float, default=0.0,
                             help="Dropout rate (0.0=none, 0.1=light, 0.2=standard)")
     train_group.add_argument("--label-smoothing", type=float, default=0.0,
@@ -1346,6 +1360,7 @@ def main():
         beta1=args.beta1,
         beta2=args.beta2,
         grad_clip=args.grad_clip,
+        grad_accum=args.gradient_accumulation_steps,
         dropout=args.dropout,
         label_smoothing=args.label_smoothing,
         lr_scheduler=args.lr_scheduler,
