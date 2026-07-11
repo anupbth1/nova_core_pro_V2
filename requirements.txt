@@ -1,0 +1,23 @@
+# ============================================================================
+# NovaLM-ULTRA v1.0 - Required Dependencies
+# ============================================================================
+# Install with: pip install -r requirements.txt
+# Or install everything: pip install -r requirements.txt[all]
+
+# === CORE DEPENDENCIES (Required for model) ===
+torch                       # PyTorch - Deep learning framework
+numpy                       # Numerical computing
+tqdm                        # Progress bars
+
+# === TRAINING DEPENDENCIES (Required for training) ===
+datasets                    # HuggingFace Datasets - For loading HF datasets
+tokenizers                  # HuggingFace Tokenizers - Fast tokenization
+transformers                # HuggingFace Transformers - For tokenizer & dataset utils
+
+# === OPTIONAL DEPENDENCIES ===
+wandb                       # Weights & Biases - Training logging (optional)
+accelerate                  # HuggingFace Accelerate - Multi-GPU support (optional)
+safetensors                 # Safe serialization format (optional)
+
+# === BENCHMARKING ===
+psutil                      # System monitoring for benchmarks
